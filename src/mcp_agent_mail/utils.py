@@ -82,6 +82,13 @@ ADJECTIVES: Iterable[str] = (
     "Wild",
     "Silent",
     "Gentle",
+    # Custom project identities
+    "Dog",
+    "Ethan",
+    "Andrew",
+    "Tin",
+    "Flat",
+    "Old",
     "Rustic",
 )
 
@@ -158,6 +165,14 @@ NOUNS: Iterable[str] = (
     "Anchor",
     "Lantern",
     "Beacon",
+    # Custom project identities
+    "Fish",
+    "Allen",
+    "Jackson",
+    "Sheep",
+    "Can",
+    "Top",
+    "Gent",
     "Compass",
 )
 
@@ -231,3 +246,4 @@ def validate_thread_id_format(thread_id: str) -> bool:
     if not candidate:
         return False
     return _THREAD_ID_RE.fullmatch(candidate) is not None
+

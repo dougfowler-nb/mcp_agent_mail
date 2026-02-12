@@ -26,6 +26,7 @@ import random
 import re
 import sys
 import time
+import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -354,6 +355,8 @@ class ProjectArchive:
 
 _PROCESS_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
 _PROCESS_LOCK_OWNERS: dict[tuple[int, str], int] = {}
+_PROCESS_LOCK_OWNER_TASKS: dict[tuple[int, str], weakref.ReferenceType[asyncio.Task[Any]]] = {}
+_PROCESS_LOCK_ACQUIRED_TS: dict[tuple[int, str], float] = {}
 
 
 class _LRURepoCache:
@@ -646,7 +649,10 @@ class AsyncFileLock:
         max_retries: int = 5,
     ) -> None:
         self._path = Path(path)
-        self._lock = SoftFileLock(str(self._path))
+        # Acquire/release run through asyncio.to_thread and may execute on different
+        # worker threads. filelock defaults to thread_local=True, which can leak locks
+        # when release happens on a different thread than acquire.
+        self._lock = SoftFileLock(str(self._path), thread_local=False)
         self._timeout = float(timeout_seconds)
         self._stale_timeout = float(max(stale_timeout_seconds, 0.0))
         self._max_retries = max_retries
@@ -689,9 +695,57 @@ class AsyncFileLock:
         if owner_id == current_task_id:
             raise RuntimeError(f"Re-entrant AsyncFileLock acquisition detected for {self._path}")
         self._process_lock = process_lock
-        await self._process_lock.acquire()
+        acquire_attempt = 0
+        while True:
+            acquire_attempt += 1
+            if self._timeout <= 0:
+                await self._process_lock.acquire()
+                break
+            try:
+                await asyncio.wait_for(self._process_lock.acquire(), timeout=self._timeout)
+                break
+            except TimeoutError:
+                owner_task_ref = _PROCESS_LOCK_OWNER_TASKS.get(self._loop_key)
+                owner_task = owner_task_ref() if owner_task_ref else None
+                owner_state = "unknown"
+                if owner_task is not None:
+                    if owner_task.cancelled():
+                        owner_state = "cancelled"
+                    elif owner_task.done():
+                        owner_state = "done"
+                    else:
+                        owner_state = "running"
+
+                acquired_at = _PROCESS_LOCK_ACQUIRED_TS.get(self._loop_key)
+                held_for = f"{max(0.0, time.monotonic() - acquired_at):.2f}" if acquired_at is not None else "unknown"
+
+                # Self-heal leaked in-process lock state when the recorded owner task is already done.
+                if (
+                    acquire_attempt == 1
+                    and self._loop_key is not None
+                    and owner_task is not None
+                    and owner_task.done()
+                    and _PROCESS_LOCKS.get(self._loop_key) is self._process_lock
+                ):
+                    replacement_lock = asyncio.Lock()
+                    _PROCESS_LOCKS[self._loop_key] = replacement_lock
+                    _PROCESS_LOCK_OWNERS.pop(self._loop_key, None)
+                    _PROCESS_LOCK_OWNER_TASKS.pop(self._loop_key, None)
+                    _PROCESS_LOCK_ACQUIRED_TS.pop(self._loop_key, None)
+                    self._process_lock = replacement_lock
+                    continue
+
+                raise TimeoutError(
+                    f"Timed out waiting for in-process lock {self._path} after {self._timeout:.2f}s "
+                    f"(owner_state={owner_state}, held_for_seconds={held_for})."
+                ) from None
         self._process_lock_held = True
         _PROCESS_LOCK_OWNERS[self._loop_key] = current_task_id
+        if current_task is not None:
+            _PROCESS_LOCK_OWNER_TASKS[self._loop_key] = weakref.ref(current_task)
+        else:
+            _PROCESS_LOCK_OWNER_TASKS.pop(self._loop_key, None)
+        _PROCESS_LOCK_ACQUIRED_TS[self._loop_key] = time.monotonic()
         try:
             total_timeout = self._timeout if self._timeout > 0 else 60.0
             remaining = total_timeout
@@ -783,19 +837,21 @@ class AsyncFileLock:
                     with contextlib.suppress(Exception):
                         await task
                 self._held = False
-                for cleanup_coro in (
-                    _to_thread(self._metadata_path.unlink, missing_ok=True),
-                    _to_thread(self._path.unlink, missing_ok=True),
-                ):
-                    task = asyncio.create_task(cleanup_coro)
-                    try:
-                        await asyncio.shield(task)
-                    except BaseException:
-                        with contextlib.suppress(Exception):
-                            await task
+                cleaned = await _to_thread(
+                    self._cleanup_lock_artifacts,
+                    attempts=8,
+                    delay_seconds=0.02 if sys.platform == "win32" else 0.01,
+                )
+                if not cleaned:
+                    _logger.warning(
+                        "file_lock.cleanup_incomplete_on_exception",
+                        extra={"path": str(self._path), "metadata_path": str(self._metadata_path)},
+                    )
 
             if self._loop_key is not None:
                 _PROCESS_LOCK_OWNERS.pop(self._loop_key, None)
+                _PROCESS_LOCK_OWNER_TASKS.pop(self._loop_key, None)
+                _PROCESS_LOCK_ACQUIRED_TS.pop(self._loop_key, None)
             if self._process_lock_held and self._process_lock:
                 self._process_lock.release()
                 self._process_lock_held = False
@@ -843,8 +899,13 @@ class AsyncFileLock:
         # Lock is stale if EITHER the owner is dead OR the age exceeds timeout
         # Special case: if stale_timeout is 0, only check owner liveness (ignore age)
         is_stale = False
-        if not owner_alive:
+        metadata_missing_grace_seconds = 2.0
+        if pid_int is not None and not owner_alive:
             # Owner process is dead - lock is stale regardless of age
+            is_stale = True
+        elif pid_int is None and isinstance(age, (int, float)) and age >= metadata_missing_grace_seconds:
+            # No owner metadata available; treat as stale only after a short grace period
+            # to avoid racing a lock file that is still being released on Windows.
             is_stale = True
         elif self._stale_timeout > 0 and isinstance(age, (int, float)) and age >= self._stale_timeout:
             # Lock is too old - stale regardless of owner status
@@ -854,12 +915,18 @@ class AsyncFileLock:
         if not is_stale:
             return False
 
-        # Clean up stale lock
-        with contextlib.suppress(Exception):
-            self._path.unlink(missing_ok=True)
-        with contextlib.suppress(Exception):
-            self._metadata_path.unlink(missing_ok=True)
-        return True
+        cleaned = self._cleanup_lock_artifacts(attempts=6, delay_seconds=0.05 if sys.platform == "win32" else 0.01)
+        if not cleaned:
+            _logger.warning(
+                "file_lock.stale_cleanup_failed",
+                extra={
+                    "path": str(self._path),
+                    "metadata_path": str(self._metadata_path),
+                    "owner_pid": pid_int,
+                    "age_seconds": round(float(age), 2) if isinstance(age, (int, float)) else None,
+                },
+            )
+        return cleaned
 
     def _write_metadata(self) -> None:
         payload = {
@@ -869,6 +936,19 @@ class AsyncFileLock:
         self._metadata_path.write_text(json.dumps(payload), encoding="utf-8")
         return None
 
+    def _cleanup_lock_artifacts(self, *, attempts: int = 4, delay_seconds: float = 0.01) -> bool:
+        """Best-effort removal of lock artifacts with retry for Windows file handle lag."""
+        for attempt in range(max(1, attempts)):
+            with contextlib.suppress(Exception):
+                self._metadata_path.unlink(missing_ok=True)
+            with contextlib.suppress(Exception):
+                self._path.unlink(missing_ok=True)
+            if not self._path.exists() and not self._metadata_path.exists():
+                return True
+            # Short bounded backoff for transient sharing violations on Windows.
+            time.sleep(delay_seconds * (attempt + 1))
+        return not self._path.exists() and not self._metadata_path.exists()
+
     async def __aexit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: object) -> None:
         if self._held:
             # Release/unlink must be cancellation-safe; otherwise cancelled tasks can leak
@@ -876,8 +956,6 @@ class AsyncFileLock:
             for cleanup_coro in (
                 _to_thread(self._lock.release),
                 asyncio.sleep(0.01) if sys.platform == "win32" else None,
-                _to_thread(self._metadata_path.unlink, missing_ok=True),
-                _to_thread(self._path.unlink, missing_ok=True),
             ):
                 if cleanup_coro is None:
                     continue
@@ -887,11 +965,23 @@ class AsyncFileLock:
                 except BaseException:
                     with contextlib.suppress(Exception):
                         await task
+            cleaned = await _to_thread(
+                self._cleanup_lock_artifacts,
+                attempts=8,
+                delay_seconds=0.02 if sys.platform == "win32" else 0.01,
+            )
+            if not cleaned:
+                _logger.warning(
+                    "file_lock.cleanup_incomplete_on_exit",
+                    extra={"path": str(self._path), "metadata_path": str(self._metadata_path)},
+                )
             self._held = False
 
         # Clean up process-level locks
         if self._loop_key is not None:
             _PROCESS_LOCK_OWNERS.pop(self._loop_key, None)
+            _PROCESS_LOCK_OWNER_TASKS.pop(self._loop_key, None)
+            _PROCESS_LOCK_ACQUIRED_TS.pop(self._loop_key, None)
         if self._process_lock_held and self._process_lock:
             self._process_lock.release()
             self._process_lock_held = False
